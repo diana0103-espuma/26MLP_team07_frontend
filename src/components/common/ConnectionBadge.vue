@@ -1,31 +1,45 @@
 <script setup>
-import { computed, ref } from 'vue'
+import { ref, watch, computed } from 'vue'
 import { useConnectionStore } from '../../stores/connection'
+import { CONFIG } from '../../config'
 
 const conn = useConnectionStore()
 const showSettings = ref(false)
-const urlInput = ref(conn.wsUrl)
+const urlInput = ref(conn.baseUrl)
+
+// 打开设置弹窗时同步当前地址
+watch(showSettings, (visible) => {
+  if (visible) urlInput.value = conn.baseUrl
+})
 
 const statusMap = computed(() => ({
   connecting: { type: 'warning', text: '连接中' },
-  connected: { type: 'success', text: conn.isUsingFallback ? '已连接' : '已连接' },
+  connected: { type: 'success', text: '已连接' },
+  unavailable: { type: 'danger', text: '后端不可用' },
   offline: { type: 'info', text: '离线（兜底配置）' }
 }))
 
 const current = computed(() => statusMap.value[conn.status] || statusMap.value.offline)
 
+const healthLine = computed(() => {
+  const h = conn.health
+  if (!h?.ml_backend) return ''
+  const pkg = h.ml_backend.package ? `${h.ml_backend.package} · ` : ''
+  return `${pkg}${h.ml_backend.detail || 'ML 包已连接'}`
+})
+
 function applyUrl() {
   const url = (urlInput.value || '').trim()
-  if (!url.startsWith('ws://') && !url.startsWith('wss://')) {
-    conn.addLog('error', 'WebSocket 地址必须以 ws:// 或 wss:// 开头')
+  if (!url.startsWith('http://') && !url.startsWith('https://')) {
+    conn.addLog('error', '后端地址必须以 http:// 或 https:// 开头')
     return
   }
-  conn.setWsUrl(url)
+  conn.setBaseUrl(url)
   showSettings.value = false
 }
 
 function reconnect() {
-  conn.connect()
+  conn.refreshAll()
 }
 </script>
 
@@ -37,7 +51,7 @@ function reconnect() {
           <span class="status-dot" :class="`dot-${conn.status}`" />
           {{ current.text }}
         </el-tag>
-        <el-button text size="small" @click.stop="reconnect" title="手动重连">
+        <el-button text size="small" @click.stop="reconnect" title="手动刷新">
           <el-icon><Refresh /></el-icon>
         </el-button>
       </div>
@@ -46,11 +60,15 @@ function reconnect() {
     <div class="conn-settings">
       <div class="settings-title">后端连接设置</div>
       <div class="settings-item">
-        <span class="settings-label">WebSocket 地址</span>
-        <el-input v-model="urlInput" size="small" placeholder="ws://127.0.0.1:8765" />
+        <span class="settings-label">HTTP 基础地址</span>
+        <el-input v-model="urlInput" size="small" :placeholder="CONFIG.defaultHttpUrl" />
       </div>
       <div class="settings-hint">
-        默认 ws://127.0.0.1:8765（本机 Mock 或后端）。后端跑在队友电脑上时改为 ws://&lt;IP&gt;:8765。
+        默认 {{ CONFIG.defaultHttpUrl }}（真实后端）；内置 Mock 使用 {{ CONFIG.mockHttpUrl }}。
+        后端跑在队友电脑上时改为 http://&lt;IP&gt;:8000。
+      </div>
+      <div v-if="conn.status === 'connected'" class="settings-hint">
+        健康信息：{{ healthLine }}
       </div>
       <div class="settings-actions">
         <el-button size="small" @click="showSettings = false">取消</el-button>
@@ -82,6 +100,10 @@ function reconnect() {
 
 .dot-connecting {
   background: var(--el-color-warning);
+}
+
+.dot-unavailable {
+  background: var(--el-color-danger);
 }
 
 .dot-offline {

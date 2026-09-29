@@ -1,20 +1,21 @@
 /**
- * 连接状态 store：WebSocket 生命周期、后端注册表、日志。
+ * 连接状态 store：HTTP 后端健康轮询、注册表刷新、日志。
  *
  * 架构核心（可扩展性）：
- * - 后端连接后主动推送 config.registry（算法/数据集/指标的完整注册表）
- * - 前端全部界面都从这个注册表动态渲染，不硬编码任何算法/指标名
- * - 未连接后端时使用 src/config/fallbackRegistry.js 的静态兜底配置，
- *   界面照常可用，只是数据固定
+ * - 后端可达时通过 GET /api/models + /api/datasets 拉取注册表，
+ *   前端全部界面从注册表动态渲染，不硬编码任何算法/指标名
+ * - 后端不可达时使用 src/config/fallbackRegistry.js 的静态兜底配置，
+ *   界面照常渲染，但实验被 gating（合同要求）
+ * - "已连接" = 最近一次 GET /api/health 返回 200 且
+ *   ml_backend.available === true；available=false 时禁止一切实验
  */
 import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
-import { wsClient } from '../services/wsClient'
+import { api } from '../services/api'
+import { httpClient } from '../services/httpClient'
+import { buildRegistry } from '../services/adapters'
 import { CONFIG } from '../config'
 import { fallbackRegistry } from '../config/fallbackRegistry'
-import { genMsgId } from '../utils/id'
-import { useTrainingStore } from './training'
-import { useDatasetStore } from './datasets'
 
 function loadSettings() {
   try {
@@ -28,17 +29,36 @@ function saveSettings(settings) {
   localStorage.setItem(CONFIG.settingsKey, JSON.stringify(settings))
 }
 
+/** 迁移旧设置：WS 时代的 wsUrl → baseUrl（仅协议方案替换，端口/路径保留） */
+function migrateSettings() {
+  const stored = loadSettings()
+  if (typeof stored.baseUrl === 'string' && stored.baseUrl) return stored.baseUrl
+  if (typeof stored.wsUrl === 'string' && stored.wsUrl) {
+    const migrated = stored.wsUrl.replace(/^ws:\/\//i, 'http://').replace(/^wss:\/\//i, 'https://')
+    return migrated
+  }
+  return CONFIG.defaultHttpUrl
+}
+
 export const useConnectionStore = defineStore('connection', () => {
   // ---------- 状态 ----------
-  const status = ref('offline') // 'connecting' | 'connected' | 'offline'
-  const registry = ref(fallbackRegistry)
+  const status = ref('connecting') // 'connecting' | 'connected' | 'unavailable' | 'offline'
+  const health = ref(null) // 最近一次 /api/health 响应体
+  const registry = ref(fallbackRegistry) // 初始兜底；只在刷新成功时替换
   const lastError = ref(null)
   const logLines = ref([]) // [{ ts, level, message }]
-  const settings = ref({ wsUrl: CONFIG.defaultWsUrl, ...loadSettings() })
+  const settings = ref({ baseUrl: migrateSettings() })
+
+  // 模块级非响应式状态
+  let pollTimer = null
+  let healthInFlight = false
 
   // ---------- 计算属性 ----------
   const isUsingFallback = computed(() => registry.value.server.name === fallbackRegistry.server.name)
-  const wsUrl = computed(() => settings.value.wsUrl || CONFIG.defaultWsUrl)
+  const baseUrl = computed(() => settings.value.baseUrl || CONFIG.defaultHttpUrl)
+  const mlBackendAvailable = computed(() => health.value?.ml_backend?.available === true)
+  /** 唯一 gating：全部实验操作的前置条件 */
+  const canRunExperiments = computed(() => status.value === 'connected' && mlBackendAvailable.value)
 
   // ---------- 内部 ----------
   function addLog(level, message) {
@@ -48,94 +68,92 @@ export const useConnectionStore = defineStore('connection', () => {
     }
   }
 
-  /** 应用后端推送的注册表 */
-  function applyRegistry(payload) {
-    if (!payload || !Array.isArray(payload.algorithms)) {
-      addLog('warn', '收到格式不正确的 config.registry，已忽略')
-      return
-    }
-    registry.value = payload
-    addLog('info', `已接收后端注册表：${payload.algorithms.length} 个算法，${(payload.datasets || []).length} 个数据集`)
-  }
-
-  /** 消息分发器：config.registry 归本 store，training.* 交给训练 store，未知类型忽略（前向兼容） */
-  function dispatchMessage(msg) {
-    const { type, payload } = msg
-    if (type === 'config.registry') {
-      applyRegistry(payload)
-    } else if (type === 'log') {
-      addLog(payload?.level || 'info', payload?.message || String(payload))
-    } else if (type === 'error') {
-      lastError.value = payload?.message || '后端返回错误'
-      addLog('error', `[${payload?.code || 'ERROR'}] ${lastError.value}`)
-    } else if (type === 'pong') {
-      // wsClient 内部处理心跳
-    } else if (typeof type === 'string' && type.startsWith('training.')) {
-      useTrainingStore().handleMessage(msg)
-    } else if (typeof type === 'string' && type.startsWith('dataset.')) {
-      useDatasetStore().handleMessage(msg)
-    } else {
-      // 协议前向兼容：未知消息类型一律忽略，不崩溃
-      console.warn('[connection] 忽略未知消息类型:', type)
-    }
+  /** 状态转换时记录日志（同状态连续失败不刷屏） */
+  function transitionTo(next, log) {
+    if (status.value === next) return
+    status.value = next
+    if (log) addLog(log.level, log.message)
   }
 
   // ---------- 动作 ----------
-  /** 应用启动时调用一次：读设置、接线、连接 */
+  /** 应用启动时调用一次：读设置、启动健康轮询 */
   function init() {
-    wsClient.onMessage = dispatchMessage
-    wsClient.onStatusChange = (s) => {
-      status.value = s
-      if (s === 'connected') {
-        addLog('info', '已连接后端服务器')
-        // 连接后可主动刷新注册表（后端通常也会自动推送）
-        refreshRegistry()
-        // 断线重连恢复：订阅未结束训练的当前状态
-        useTrainingStore().onReconnected()
-      } else if (s === 'offline') {
-        addLog('warn', '连接断开，界面使用静态兜底配置')
+    httpClient.setBaseUrl(baseUrl.value)
+    checkHealth()
+    pollTimer = setInterval(checkHealth, CONFIG.healthPollIntervalMs)
+  }
+
+  /** 健康检查：200+available → connected；200+!available → unavailable；其余 → offline */
+  async function checkHealth() {
+    if (healthInFlight) return
+    healthInFlight = true
+    try {
+      const resp = await api.checkHealth()
+      health.value = resp
+      if (resp?.ml_backend?.available === true) {
+        const wasConnected = status.value === 'connected'
+        transitionTo('connected', { level: 'info', message: '已连接后端服务器' })
+        if (!wasConnected) refreshRegistry() // 首次进入连接态时刷新注册表
       } else {
-        addLog('info', '正在连接后端服务器…')
+        const detail = resp?.ml_backend?.detail
+        transitionTo('unavailable', {
+          level: 'warn',
+          message: `后端服务可达，但 ML 包不可用${detail ? `（${detail}）` : ''}`
+        })
       }
+    } catch (err) {
+      lastError.value = err.message
+      transitionTo('offline', {
+        level: 'error',
+        message: `无法连接后端服务器（${err.code || 'network_error'}），界面使用静态兜底配置`
+      })
+    } finally {
+      healthInFlight = false
     }
-    connect()
   }
 
-  function connect(url) {
-    if (url) settings.value.wsUrl = url
-    wsClient.connect(settings.value.wsUrl)
+  /** 拉取模型/数据集并重建注册表；失败保持现状（不降级到兜底） */
+  async function refreshRegistry() {
+    try {
+      const [models, datasets] = await Promise.all([api.fetchModels(), api.fetchDatasets()])
+      registry.value = buildRegistry({ models, datasets, baseUrl: baseUrl.value })
+      addLog('info', `已获取后端注册表：${models.length} 个模型，${datasets.length} 个数据集`)
+    } catch (err) {
+      addLog('error', `注册表刷新失败：${err.message}`)
+    }
   }
 
-  function disconnect() {
-    wsClient.disconnect()
+  /** 修改后端地址：持久化 + 立即重新检查 */
+  function setBaseUrl(url) {
+    settings.value.baseUrl = url
+    saveSettings({ baseUrl: url })
+    httpClient.setBaseUrl(url)
+    status.value = 'connecting'
+    addLog('info', `后端地址已更新为 ${url}，正在重新连接…`)
+    checkHealth()
   }
 
-  function setWsUrl(url) {
-    settings.value.wsUrl = url
-    saveSettings({ wsUrl: url })
-    // 重新连接生效
-    wsClient.disconnect()
-    setTimeout(() => wsClient.connect(url), 300)
-  }
-
-  function refreshRegistry() {
-    wsClient.send({ type: 'config.get', id: genMsgId(), payload: {} })
+  /** 手动刷新（badge 刷新按钮）：健康检查，成功时连带刷新注册表 */
+  function refreshAll() {
+    checkHealth()
   }
 
   return {
     status,
+    health,
     registry,
     lastError,
     logLines,
     settings,
     isUsingFallback,
-    wsUrl,
+    baseUrl,
+    mlBackendAvailable,
+    canRunExperiments,
     init,
-    connect,
-    disconnect,
-    setWsUrl,
+    checkHealth,
     refreshRegistry,
-    dispatchMessage,
+    setBaseUrl,
+    refreshAll,
     addLog
   }
 })

@@ -2,21 +2,25 @@
 import { computed, ref, watch } from 'vue'
 import { useConnectionStore } from '../stores/connection'
 import { useTrainingStore } from '../stores/training'
+import { CONFIG } from '../config'
+import { formatDuration } from '../utils/format'
 import AlgorithmList from '../components/experiment/AlgorithmList.vue'
 import HyperparamForm from '../components/experiment/HyperparamForm.vue'
 import RunMonitor from '../components/experiment/RunMonitor.vue'
 import MetricCard from '../components/metrics/MetricCard.vue'
+import JsonFallback from '../components/metrics/JsonFallback.vue'
 
 /**
  * 实验工作台（核心页面）：
  * 左：算法列表（注册表驱动）｜右上：超参数表单 + 数据集/切分设置｜右下：训练监控与结果
+ * HTTP 合同下训练是同步请求：监控面板只有等待态与失败态，结果面板展示最终 metrics。
  */
 const conn = useConnectionStore()
 const training = useTrainingStore()
 
 const selectedAlgo = ref(null)
 const selectedDatasetId = ref('')
-const split = ref({ testRatio: 0.3, seed: 42, stratify: true })
+const split = ref({ testSize: CONFIG.defaultTestSize, seed: CONFIG.defaultSeed })
 
 const algorithms = computed(() => conn.registry.algorithms || [])
 const datasets = computed(() => conn.registry.datasets || [])
@@ -31,19 +35,14 @@ const selectedDataset = computed(() =>
   datasets.value.find((d) => d.id === selectedDatasetId.value)
 )
 
-// 切换算法时自动选中第一个适用数据集，并重置切分参数为数据集默认值
+// 切换算法时自动选中第一个适用数据集，并重置切分参数为默认值
 watch(
   () => selectedAlgo.value?.id,
   () => {
     const list = availableDatasets.value
     if (list.length > 0) {
       selectedDatasetId.value = list[0].id
-      const def = list[0].split || {}
-      split.value = {
-        testRatio: def.defaultTestRatio ?? 0.3,
-        seed: def.defaultSeed ?? 42,
-        stratify: def.stratifySupported ?? false
-      }
+      split.value = { testSize: CONFIG.defaultTestSize, seed: CONFIG.defaultSeed }
     } else {
       selectedDatasetId.value = ''
     }
@@ -51,26 +50,55 @@ watch(
 )
 
 function handleTrain(hyperparams) {
-  if (!selectedAlgo.value || !selectedDatasetId.value) return
+  if (!selectedAlgo.value || !selectedDataset.value) return
   training.startRun({
-    algorithmId: selectedAlgo.value.id,
-    algorithmName: selectedAlgo.value.name,
-    datasetId: selectedDatasetId.value,
-    datasetName: selectedDataset.value?.name || selectedDatasetId.value,
-    hyperparams,
-    split: { ...split.value }
+    modelId: selectedAlgo.value.id,
+    modelName: selectedAlgo.value.name,
+    datasetId: selectedDataset.value.id,
+    datasetName: selectedDataset.value.name,
+    taskType: selectedDataset.value.taskType,
+    params: hyperparams,
+    testSize: split.value.testSize,
+    randomState: split.value.seed
   })
 }
 
 const selectedRunId = ref('')
 const selectedRun = computed(() => training.getRun(selectedRunId.value))
 
-/** 结果指标定义：按 run 所用数据集的任务类型从注册表取 */
+// 新完成的 run 自动选中（结果面板跟随最新一次训练）
+watch(
+  () => training.finishedRuns[0]?.id,
+  (id) => {
+    if (id) selectedRunId.value = id
+  }
+)
+
+/** 结果指标定义：按 run 的任务类型从静态指标表取 */
 const metricDefs = computed(() => {
   if (!selectedRun.value) return []
-  const dataset = datasets.value.find((d) => d.id === selectedRun.value.datasetId)
-  const taskType = dataset?.taskType || 'classification'
-  return conn.registry.metrics?.[taskType] || []
+  return conn.registry.metrics?.[selectedRun.value.taskType] || []
+})
+
+/** 只渲染结果中实际存在的指标（合同 metrics 键不透明，图表键可能缺失） */
+const visibleMetricDefs = computed(() =>
+  metricDefs.value.filter((d) => {
+    const v = selectedRun.value?.result?.metrics?.[d.id]
+    return v !== undefined && v !== null
+  })
+)
+
+const gatingMessage = computed(() => {
+  switch (conn.status) {
+    case 'offline':
+      return '未连接后端服务器，当前显示离线兜底配置，无法发起实验'
+    case 'unavailable':
+      return '后端服务可达，但 ML 包不可用，无法发起实验'
+    case 'connecting':
+      return '正在连接后端服务器…'
+    default:
+      return ''
+  }
 })
 </script>
 
@@ -90,8 +118,18 @@ const metricDefs = computed(() => {
             <h3 class="page-card-title">{{ selectedAlgo.name }}</h3>
             <p class="algo-summary">{{ selectedAlgo.description }}</p>
           </div>
-          <el-tag v-if="conn.isUsingFallback" type="info" effect="plain">未连接后端，仅本地演示配置</el-tag>
+          <el-tag v-if="conn.isUsingFallback" type="info" effect="plain">离线兜底配置</el-tag>
         </div>
+
+        <el-alert
+          v-if="!conn.canRunExperiments"
+          type="warning"
+          :closable="false"
+          show-icon
+          class="gating-alert"
+        >
+          {{ gatingMessage }}
+        </el-alert>
 
         <el-form label-position="top" class="dataset-form">
           <div class="dataset-row">
@@ -105,31 +143,27 @@ const metricDefs = computed(() => {
                 />
               </el-select>
             </el-form-item>
-            <el-form-item label="测试集比例">
-              <el-slider v-model="split.testRatio" :min="0.1" :max="0.5" :step="0.05" style="width: 160px" show-input :show-input-controls="false" />
+            <!-- 合同：聚类实验必须省略 test_size；异常检测忽略该值 -->
+            <el-form-item
+              v-if="selectedDataset && selectedDataset.taskType !== 'clustering' && selectedDataset.taskType !== 'anomaly_detection'"
+              label="测试集比例"
+            >
+              <el-slider v-model="split.testSize" :min="0.1" :max="0.5" :step="0.05" style="width: 160px" show-input :show-input-controls="false" />
             </el-form-item>
             <el-form-item label="随机种子">
               <el-input-number v-model="split.seed" :min="0" :max="99999" controls-position="right" style="width: 130px" />
             </el-form-item>
-            <el-form-item label="分层抽样">
-              <el-switch v-model="split.stratify" :disabled="!selectedDataset?.split?.stratifySupported" />
-            </el-form-item>
           </div>
         </el-form>
 
-        <HyperparamForm :algorithm="selectedAlgo" @submit="handleTrain" />
+        <HyperparamForm :algorithm="selectedAlgo" :disabled="!conn.canRunExperiments" @submit="handleTrain" />
       </div>
 
-      <!-- 训练监控 -->
-      <div v-if="training.activeRuns.length > 0" class="page-card">
-        <h3 class="page-card-title">训练中</h3>
-        <RunMonitor
-          v-for="run in training.activeRuns"
-          :key="run.runId"
-          :run="run"
-          @cancel="training.cancelRun(run.runId)"
-          @select="selectedRunId = run.runId"
-        />
+      <!-- 训练监控：等待中 + 失败 -->
+      <div v-if="training.activeRuns.length > 0 || training.errorRuns.length > 0" class="page-card">
+        <h3 class="page-card-title">训练监控</h3>
+        <RunMonitor v-for="run in training.activeRuns" :key="run.id" :run="run" />
+        <RunMonitor v-for="run in training.errorRuns" :key="run.id" :run="run" />
       </div>
 
       <!-- 历史结果 -->
@@ -139,24 +173,36 @@ const metricDefs = computed(() => {
           <el-button text size="small" @click="training.clearRuns()">清空</el-button>
         </h3>
         <el-radio-group v-model="selectedRunId" size="small" class="run-selector">
-          <el-radio-button v-for="run in training.finishedRuns" :key="run.runId" :value="run.runId">
-            {{ run.algorithmName }} · {{ run.datasetName }}
+          <el-radio-button v-for="run in training.finishedRuns" :key="run.id" :value="run.id">
+            {{ run.modelName }} · {{ run.datasetName }}
           </el-radio-button>
         </el-radio-group>
         <div v-if="selectedRun" class="result-area">
           <div class="result-meta">
             <el-tag type="success" size="small">已完成</el-tag>
-            <span class="meta-text">耗时 {{ selectedRun.progress.elapsedMs }} ms</span>
+            <span class="meta-text">耗时 {{ formatDuration(selectedRun.elapsedMs) }}</span>
+            <span class="meta-text mono">run_id: {{ selectedRun.runId || selectedRun.id }}</span>
           </div>
           <div class="metric-grid">
             <MetricCard
-              v-for="metric in metricDefs"
+              v-for="metric in visibleMetricDefs"
               :key="metric.id"
               :metric="metric"
               :value="selectedRun.result?.metrics?.[metric.id]"
               :extra="selectedRun.result?.metrics"
             />
           </div>
+          <!-- 合同 metrics 键不透明：无已知定义命中时展示原始 JSON -->
+          <JsonFallback v-if="visibleMetricDefs.length === 0" :value="selectedRun.result?.metrics" />
+
+          <el-collapse class="result-details">
+            <el-collapse-item v-if="selectedRun.result?.effective_params" title="有效参数">
+              <JsonFallback :value="selectedRun.result.effective_params" />
+            </el-collapse-item>
+            <el-collapse-item v-if="selectedRun.result?.metadata" title="元数据">
+              <JsonFallback :value="selectedRun.result.metadata" />
+            </el-collapse-item>
+          </el-collapse>
         </div>
       </div>
     </div>
@@ -194,6 +240,10 @@ const metricDefs = computed(() => {
   font-size: 13px;
 }
 
+.gating-alert {
+  margin-bottom: 12px;
+}
+
 .dataset-row {
   display: flex;
   flex-wrap: wrap;
@@ -221,9 +271,17 @@ const metricDefs = computed(() => {
   color: var(--el-text-color-secondary);
 }
 
+.mono {
+  font-family: Consolas, Menlo, monospace;
+}
+
 .metric-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
   gap: 12px;
+}
+
+.result-details {
+  margin-top: 12px;
 }
 </style>
