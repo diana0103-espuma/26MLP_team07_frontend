@@ -4,12 +4,14 @@ import { buildFormModel, extractHyperparams, groupHyperparams } from '../../util
 
 /**
  * 动态超参数表单：根据算法的 hyperparams schema 渲染对应控件。
- * 控件类型映射（可扩展性演示点，协议见 docs/PROTOCOL.md）：
- *   int → 整数输入框；float → 小数输入框；choice → 下拉框；
- *   bool → 开关；range → 双滑块；未知类型 → 普通文本框兜底
+ * schema 由 adapters.js 从合同 default_params 推断（无 min/max/options）：
+ *   int → 整数输入框；float → 小数输入框；bool → 开关；
+ *   text → 文本框；choice/range 等历史类型保留支持；未知类型 → 文本框兜底
  */
 const props = defineProps({
-  algorithm: { type: Object, default: null }
+  algorithm: { type: Object, default: null },
+  /** 后端不可用（gating）时禁用训练按钮 */
+  disabled: { type: Boolean, default: false }
 })
 
 const emit = defineEmits(['submit'])
@@ -62,14 +64,13 @@ function submit() {
           controls-position="right"
           class="full-width"
         />
-        <!-- 小数 -->
+        <!-- 小数（合同推断的参数无边界，不设 precision 以免舍入小值如 1e-9） -->
         <el-input-number
           v-else-if="p.type === 'float'"
           v-model="model[p.name]"
           :min="p.min"
           :max="p.max"
           :step="p.step || 0.01"
-          :precision="6"
           controls-position="right"
           class="full-width"
         />
@@ -89,6 +90,8 @@ function submit() {
           :step="p.step || 1"
           class="full-width"
         />
+        <!-- 文本（合同推断：字符串默认值） -->
+        <el-input v-else-if="p.type === 'text'" v-model="model[p.name]" class="full-width" />
         <!-- 未知类型：文本输入兜底，绝不崩溃 -->
         <el-input v-else v-model="model[p.name]" :placeholder="`类型 ${p.type} 未识别，按文本处理`" />
       </el-form-item>
@@ -96,7 +99,7 @@ function submit() {
 
     <div class="form-actions">
       <el-button @click="resetDefaults">恢复默认</el-button>
-      <el-button type="primary" @click="submit">开始训练</el-button>
+      <el-button type="primary" :disabled="disabled" @click="submit">开始训练</el-button>
     </div>
   </el-form>
 

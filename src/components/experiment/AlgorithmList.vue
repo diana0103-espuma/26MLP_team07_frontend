@@ -15,7 +15,8 @@ const emit = defineEmits(['select'])
 const TASK_TYPE_NAMES = {
   classification: '分类',
   regression: '回归',
-  clustering: '聚类'
+  clustering: '聚类',
+  anomaly_detection: '异常检测'
 }
 
 /** 按任务类型分组：[{ taskType, name, items }] */

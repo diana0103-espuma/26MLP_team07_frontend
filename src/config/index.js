@@ -1,23 +1,27 @@
 /**
- * 前端全局配置：WebSocket 地址、心跳间隔、各种上限。
- * WS 地址可在界面右上角"连接设置"中修改，保存在 localStorage。
+ * 前端全局配置：HTTP 后端地址、轮询与超时、各种上限。
+ * 后端地址可在界面右上角"连接设置"中修改，保存在 localStorage。
+ *
+ * 接口唯一合同见 HTTP_API_CONTRACT.md（仓库根目录）。
  */
 export const CONFIG = {
-  // 默认后端 WebSocket 地址（mock 服务器也使用此端口）
-  defaultWsUrl: 'ws://127.0.0.1:8765',
+  // 默认后端 HTTP 基地址（合同地址，真实 FastAPI 后端）
+  defaultHttpUrl: 'http://127.0.0.1:8000',
+  // 内置 Mock 后端基地址（提示文案用，服务见 mock/server.js）
+  mockHttpUrl: 'http://127.0.0.1:8765',
   // localStorage 中保存设置的键名
   settingsKey: 'mlviz.settings',
-  // 心跳间隔（毫秒）
-  heartbeatInterval: 15000,
-  // 心跳应答超时（毫秒），超时判定连接已死
-  heartbeatTimeout: 5000,
-  // 重连退避：起始 1s，每次翻倍，上限 15s
-  reconnectBase: 1000,
-  reconnectMax: 15000,
-  // 实时曲线每个序列最多保留的点数
-  maxChartPoints: 500,
-  // progress 消息渲染节流（毫秒）：距上一条小于该间隔则丢弃
-  progressThrottleMs: 100,
+  // 健康检查轮询间隔（毫秒）
+  healthPollIntervalMs: 15000,
+  // health / 发现请求超时（毫秒）
+  requestTimeoutMs: 10000,
+  // 同步训练请求超时（毫秒，5 分钟）
+  experimentTimeoutMs: 300000,
+  // 运行中耗时刷新间隔（毫秒）
+  elapsedTickMs: 1000,
+  // 切分默认值（合同只定义 test_size/random_state 字段）
+  defaultTestSize: 0.2,
+  defaultSeed: 42,
   // 日志面板最多保留行数
   maxLogLines: 200,
   // 训练历史最多保留条数（localStorage）

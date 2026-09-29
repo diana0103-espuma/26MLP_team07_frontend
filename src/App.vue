@@ -7,7 +7,7 @@ import ConnectionBadge from './components/common/ConnectionBadge.vue'
 const route = useRoute()
 const conn = useConnectionStore()
 
-// 应用启动：接线 WebSocket 客户端并尝试连接后端（连不上会自动重试 + 兜底配置）
+// 应用启动：启动 HTTP 健康轮询（连不上时界面使用兜底配置，实验被 gating）
 onMounted(() => {
   conn.init()
 })
